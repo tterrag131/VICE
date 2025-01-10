@@ -65,5 +65,7 @@ VICE was created to fill a gap in operational data collection. The largest organ
 - API Development
 - User Interface Design
 - Industrial IoT Applications
+- End to end development of software
+- Data pipeline creation
 
 This project showcases a comprehensive approach to industrial process optimization, combining cutting-edge technologies with practical applications to solve real-world challenges in logistics and operations.
