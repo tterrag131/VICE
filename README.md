@@ -6,6 +6,8 @@ Here's a more professional and polished README based on the information provided
 
 VICE is an advanced monitoring system designed for industrial conveyor belts, providing real-time detection of operational anomalies, performance metrics, and automated reporting capabilities. It leverages computer vision and color detection to identify various operational states and potential issues.
 
+VICE was created to fill a gap in operational data collection. The largest organ of the FC cuurently collects no logs and the only visualization of the conveyance is an internet explorer page that only 13 CPUs have access to in the wareouse. The increase accountability on RME for conveyance faults and to highlight errors and collect data VICE has been created to absolve these issues.
+
 ### Key Features
 
 1. **Real-Time Monitoring**
