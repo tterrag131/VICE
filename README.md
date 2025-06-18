@@ -8,6 +8,14 @@ VICE is an advanced monitoring system designed for industrial conveyor belts, pr
 
 VICE was created to fill a gap in operational data collection. The largest organ of the FC cuurently collects no logs and the only visualization of the conveyance is an internet explorer page that only 13 CPUs have access to in the wareouse. The increase accountability on RME for conveyance faults and to highlight errors and collect data VICE has been created to absolve these issues.
 
+Since the initial VICE application was launched at SMF1 there has been 3.2 versions the latest of which revised the database structure to its current form, the current state of VICE is highly optimized for database creation with the added benefit of user visuals. the highly optimized data collection of VICE is housed in seperate databases that are relational by nature. These relational datastores are secured on AWS servers and local housings on SMF1 property. 
+
+### Needed features
+
+1. ** ROI Families**
+   - VICE is desperately in need of ROI families. because the user is responsible for defining ROIs they need the ability to house these ROIs in nesting families, This will ensure that each ROI is tracked in its microclimate as well as the macro. providing these families will also create valid data keeping that will enhance data output and insight creation.
+   - Additionally VICE would benefit greatly from a UI and ROI simplification to make the user experience of adding ROIs simpler.
+
 ### Key Features
 
 1. **Real-Time Monitoring**
