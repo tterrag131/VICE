@@ -12,20 +12,21 @@ from collections import deque, defaultdict
 from datetime import datetime, timedelta
 import threading
 import sqlite3
-import pandas as pd # For daily report generation
+import pandas as pd
 from pathlib import Path
 import logging
 import webbrowser
+from queue import Queue, Empty
 
 from PyQt5.QtCore import (
-    QObject, pyqtSignal, Qt, QTimer, QThread, QPoint, QSize, QRect, pyqtSlot
+    QObject, pyqtSignal, Qt, QTimer, QThread, QPoint, QSize, QRect, pyqtSlot, QDateTime
 )
 from PyQt5.QtWidgets import (
     QWidget, QSpinBox, QCheckBox, QProgressBar, QGridLayout, QRadioButton,
     QVBoxLayout, QHBoxLayout, QFileDialog, QLabel, QScrollArea, QApplication,
     QPushButton, QGroupBox, QStyle, QMenu, QStatusBar, QMessageBox, QInputDialog,
     QDialog, QListWidget, QSlider, QDoubleSpinBox, QMainWindow, QSizePolicy,
-    QListWidgetItem
+    QListWidgetItem, QDateTimeEdit, QTableWidget, QTableWidgetItem, QHeaderView,QSplitter, QFrame
 )
 from PyQt5.QtGui import (
     QColor, QPalette, QFont, QPixmap, QImage, QPainter, QPen, QBrush, QIcon
@@ -36,16 +37,18 @@ from screeninfo import get_monitors
 from flask import Flask, jsonify, render_template # type: ignore
 from flask_cors import CORS # type: ignore
 
+
 # --- Configuration & Constants ---
-# General Settings
-APP_NAME = "VICE (Visual Identification Conveyance Enhancement) V3.0"
-DB_NAME = "conveyor_metrics_v3.db"
+APP_NAME = "VICE (Visual Identification Conveyance Enhancement) V3.2"
+DB_NAME = "vice_main_database.db" # Renamed for clarity
+INEFFICIENCY_DB_NAME = "vice_inefficiency_events.db" # NEW: Database for non-critical events
 LOG_LEVEL = logging.INFO
-CAPTURE_INTERVAL_DEFAULT = 1.0  # seconds (adjust for responsiveness vs. CPU load)
-RESOLUTION_SCALE_DEFAULT = 50   # percent
-FLASK_HOST = '0.0.0.0'
-FLASK_PORT = 5965
-FLASK_DEBUG = False
+CAPTURE_INTERVAL_DEFAULT = 1.0
+RESOLUTION_SCALE_DEFAULT = 50
+FLASK_HOST = '0.0.0.0'; FLASK_PORT = 5965
+
+DB_BATCH_INSERT_INTERVAL = 5.0 # seconds
+HEALTH_SNAPSHOT_INTERVAL = 60.0 # seconds
 
 # Debouncing settings for blinking lights
 # Grace period should be slightly longer than the OFF period of a blink.
@@ -65,9 +68,15 @@ COLOR_DEFINITIONS: Dict[str, Dict[str, Any]] = {
 }
 
 
-# Paths
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / DB_NAME
+INEFFICIENCY_DB_PATH = BASE_DIR / INEFFICIENCY_DB_NAME # NEW
+REPORTS_DIR = BASE_DIR / "12_Hour_Reports"
+REPORTS_DIR.mkdir(exist_ok=True) # Ensure reports directory exists
+
+logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler(sys.stdout)])
+logger = logging.getLogger(__name__)
+
 TEMPLATES_DIR = BASE_DIR / "templates"
 TEMPLATES_DIR.mkdir(exist_ok=True)
 STATIC_DIR = BASE_DIR / "static" 
@@ -120,10 +129,6 @@ class RegionStatus:
         if not self.is_anomaly or not self.detected_colors: return COLOR_DEFINITIONS["green"]["bgr"]
         return self.detected_colors[0].bgr
 
-sqlite3.register_adapter(datetime, lambda dt: dt.isoformat())
-sqlite3.register_converter('datetime', lambda s: datetime.fromisoformat(s.decode()))
-
-
 # --- Utility Functions ---
 def get_standard_icon(style_enum):
     return QApplication.style().standardIcon(style_enum)
@@ -132,8 +137,107 @@ def get_standard_icon(style_enum):
 sqlite3.register_adapter(datetime, lambda dt: dt.isoformat())
 sqlite3.register_converter('datetime', lambda s: datetime.fromisoformat(s.decode()))
 
+class DataLogger(QThread):
+    def __init__(self, main_db_path: Path, inefficiency_db_path: Path, parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self.main_db_path = main_db_path
+        self.inefficiency_db_path = inefficiency_db_path
+        self.log_queue = Queue()
+        self.running = True
+        self._init_db_lock = threading.Lock()
+        self._initialize_databases()
+        
+    def _initialize_databases(self):
+        with self._init_db_lock:
+            try: # Main DB
+                with sqlite3.connect(self.main_db_path) as conn:
+                    c = conn.cursor()
+                    c.execute("CREATE TABLE IF NOT EXISTS monitoring_sessions (id INTEGER PRIMARY KEY, start_time DATETIME, end_time DATETIME, roi_count INTEGER, settings_json TEXT)")
+                    c.execute("CREATE TABLE IF NOT EXISTS system_snapshots (id INTEGER PRIMARY KEY, session_id INTEGER, timestamp DATETIME, health_percentage REAL, active_anomalies INTEGER, FOREIGN KEY(session_id) REFERENCES monitoring_sessions(id))")
+                    c.execute("CREATE TABLE IF NOT EXISTS completed_events (id INTEGER PRIMARY KEY, session_id INTEGER, roi_title TEXT, primary_event_type TEXT, start_time DATETIME, end_time DATETIME, duration_seconds REAL, secondary_colors_json TEXT, FOREIGN KEY(session_id) REFERENCES monitoring_sessions(id))")
+            except Exception as e: logger.exception(f"Main DB init error: {e}")
 
-# --- Monitor Selection Dialog ---
+            try: # Inefficiency DB
+                with sqlite3.connect(self.inefficiency_db_path) as conn:
+                    c = conn.cursor()
+                    c.execute("CREATE TABLE IF NOT EXISTS completed_inefficiency_events (id INTEGER PRIMARY KEY, session_id INTEGER, roi_title TEXT, primary_event_type TEXT, start_time DATETIME, end_time DATETIME, duration_seconds REAL, secondary_colors_json TEXT, FOREIGN KEY(session_id) REFERENCES monitoring_sessions(id))")
+            except Exception as e: logger.exception(f"Inefficiency DB init error: {e}")
+
+    def run(self):
+        logger.info("DataLogger thread started.");
+        while self.running:
+            try:
+                log_batch = []; 
+                try: log_batch.append(self.log_queue.get(timeout=DB_BATCH_INSERT_INTERVAL))
+                except Empty: pass
+                while not self.log_queue.empty() and len(log_batch) < 50: log_batch.append(self.log_queue.get_nowait())
+                if log_batch: self._process_batch(log_batch)
+            except Exception as e: logger.exception(f"Error in DataLogger thread: {e}")
+        logger.info("DataLogger thread finished.")
+    
+    def _process_batch(self, batch):
+        # Separate batches by database to ensure single connection per block
+        main_db_batch = [item for item in batch if item[0] != 'LOG_INEFFICIENCY_EVENT']
+        inefficiency_db_batch = [item for item in batch if item[0] == 'LOG_INEFFICIENCY_EVENT']
+
+        if main_db_batch:
+            try:
+                with sqlite3.connect(self.main_db_path, timeout=10) as conn:
+                    c = conn.cursor()
+                    for cmd, data in main_db_batch:
+                        if cmd == 'START_SESSION': c.execute("INSERT INTO monitoring_sessions (start_time, roi_count, settings_json) VALUES (?, ?, ?)", (data['start_time'], data['roi_count'], data['settings_json'])); data['callback'](c.lastrowid)
+                        elif cmd == 'END_SESSION': c.execute("UPDATE monitoring_sessions SET end_time = ? WHERE id = ?", (data['end_time'], data['session_id']))
+                        elif cmd == 'LOG_SNAPSHOT': c.execute("INSERT INTO system_snapshots (session_id, timestamp, health_percentage, active_anomalies) VALUES (?, ?, ?, ?)", (data['session_id'], data['timestamp'], data['health'], data['active_anomalies']))
+                        elif cmd == 'LOG_CRITICAL_EVENT': c.execute("INSERT INTO completed_events (session_id, roi_title, primary_event_type, start_time, end_time, duration_seconds, secondary_colors_json) VALUES (?, ?, ?, ?, ?, ?, ?)", (data['session_id'], data['roi_title'], data['event_type'], data['start_time'], data['end_time'], data['duration'], json.dumps(data['secondary_colors'])))
+                    conn.commit()
+            except Exception as e: logger.error(f"Failed to process main DB log batch: {e}")
+        
+        if inefficiency_db_batch:
+            try:
+                with sqlite3.connect(self.inefficiency_db_path, timeout=10) as conn:
+                    c = conn.cursor()
+                    for cmd, data in inefficiency_db_batch:
+                        c.execute("INSERT INTO completed_inefficiency_events (session_id, roi_title, primary_event_type, start_time, end_time, duration_seconds, secondary_colors_json) VALUES (?, ?, ?, ?, ?, ?, ?)", (data['session_id'], data['roi_title'], data['event_type'], data['start_time'], data['end_time'], data['duration'], json.dumps(data['secondary_colors'])))
+                    conn.commit()
+            except Exception as e: logger.error(f"Failed to process inefficiency DB log batch: {e}")
+
+    def stop(self): self.running = False; self.log_queue.put((None, None))
+    def add_log_entry(self, command, data): self.log_queue.put((command, data))
+    
+    # Data fetching methods remain the same, they only query the main DB.
+    def get_kpi_metrics(self, start_dt, end_dt):
+        try:
+            with sqlite3.connect(f'file:{self.main_db_path}?mode=ro', uri=True) as conn:
+                q = "SELECT duration_seconds FROM completed_events WHERE primary_event_type IN ('JAM', 'E-STOP') AND end_time BETWEEN ? AND ?"
+                rows = conn.execute(q, (start_dt, end_dt)).fetchall()
+                if not rows: return {"total_downtime": 0, "mtbf": "N/A", "mttr": "N/A", "failure_count": 0}
+                downtime = sum(r[0] for r in rows); failures = len(rows); uptime = (end_dt-start_dt).total_seconds() - downtime
+                return {"total_downtime": downtime, "mtbf": uptime / failures if failures > 0 else uptime, "mttr": downtime / failures if failures > 0 else 0, "failure_count": failures}
+        except Exception as e: logger.error(f"DB KPI error: {e}"); return {}
+    def get_pareto_analysis(self, start_dt, end_dt):
+        try:
+            with sqlite3.connect(f'file:{self.main_db_path}?mode=ro', uri=True) as conn:
+                q = "SELECT roi_title, SUM(duration_seconds) as total_duration FROM completed_events WHERE primary_event_type IN ('JAM', 'E-STOP') AND end_time BETWEEN ? AND ? GROUP BY roi_title ORDER BY total_duration DESC LIMIT 5"
+                return [{"roi": r[0], "duration": r[1]} for r in conn.execute(q, (start_dt, end_dt)).fetchall()]
+        except Exception as e: logger.error(f"DB Pareto error: {e}"); return []
+    def get_health_snapshots(self, start_dt, end_dt):
+        try:
+            with sqlite3.connect(f'file:{self.main_db_path}?mode=ro', uri=True) as conn:
+                q = "SELECT timestamp, health_percentage FROM system_snapshots WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp"
+                return [{"timestamp": r[0].isoformat(), "health": r[1]} for r in conn.execute(q, (start_dt, end_dt)).fetchall()]
+        except Exception as e: logger.error(f"DB health snapshot error: {e}"); return []
+    def generate_12_hour_report_archive(self):
+        logger.info("Generating 12-hour report archives..."); now = datetime.now()
+        report_path_main = REPORTS_DIR / f"main_report_archive_{now.strftime('%Y-%m-%d_%H-%M-%S')}.db"
+        report_path_inefficiency = REPORTS_DIR / f"inefficiency_report_archive_{now.strftime('%Y-%m-%d_%H-%M-%S')}.db"
+        try:
+            with sqlite3.connect(self.main_db_path) as main_conn, sqlite3.connect(report_path_main) as report_conn:
+                main_conn.backup(report_conn); logger.info(f"Successfully created main backup: {report_path_main}")
+            with sqlite3.connect(self.inefficiency_db_path) as main_conn, sqlite3.connect(report_path_inefficiency) as report_conn:
+                main_conn.backup(report_conn); logger.info(f"Successfully created inefficiency backup: {report_path_inefficiency}")
+        except Exception as e: logger.exception(f"Failed to generate 12-hour report: {e}")
+
+
 class MonitorSelector(QDialog):
     def __init__(self, monitors: List[Any], parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -167,40 +271,46 @@ class MonitorSelector(QDialog):
             return self.monitors[self.selected_monitor_index]
         return None
 
-# --- (Located in the Core Application Classes section) ---
+
 class AlertWindow(QWidget):
+    # --- Configuration for the new AlertWindow ---
+    MAX_RECENTLY_CLEARED_TO_SHOW = 10 # Keep this many "green" rows before pruning
+
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.region_row_widgets: Dict[str, QWidget] = {} 
-        self.all_region_statuses: Dict[str, RegionStatus] = {} # Caches the latest status object for each region
+        self.setWindowTitle("Region Status Monitor")
+        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setMinimumSize(800, 800)
+
+        # Internal state
+        self.all_region_statuses: Dict[str, RegionStatus] = {}
+        self.recently_cleared_queue: Deque[str] = deque(maxlen=self.MAX_RECENTLY_CLEARED_TO_SHOW)
+        
         self.conveyor_health = 100.0
         self.session_start_time = datetime.now()
-        self.active_rois_count = 0
+        
+        # UI Elements
+        self.region_row_widgets: Dict[str, QWidget] = {} # Only stores widgets currently visible
+
         self.initUI()
         self.position_window()
 
     def initUI(self):
-        self.setWindowTitle("Region Status Monitor"); self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.Tool)
-        self.setMinimumSize(800, 800) # Increased width for new columns
-
         main_layout = QVBoxLayout(self); main_layout.setContentsMargins(10, 10, 10, 10); main_layout.setSpacing(10)
         
-        # --- Top Section (Unchanged) ---
         title_label = QLabel("Region Monitoring Status"); title_label.setFont(QFont("Arial", 16, QFont.Bold)); title_label.setAlignment(Qt.AlignCenter); main_layout.addWidget(title_label)
+        
         health_group = QGroupBox("Overall Conveyor Health"); health_layout = QHBoxLayout(); self.health_label = QLabel(f"Health: {self.conveyor_health:.1f}%"); self.health_label.setFont(QFont("Arial", 12, QFont.Bold)); self.health_progress_bar = QProgressBar(); self.health_progress_bar.setRange(0, 100); self.health_progress_bar.setValue(int(self.conveyor_health)); self.health_progress_bar.setTextVisible(False); health_layout.addWidget(self.health_label); health_layout.addWidget(self.health_progress_bar, 1); health_group.setLayout(health_layout); main_layout.addWidget(health_group)
-        session_info_layout = QHBoxLayout(); self.uptime_label = QLabel("Uptime: 0s"); self.active_rois_label = QLabel("ROIs: 0"); session_info_layout.addWidget(self.uptime_label); session_info_layout.addStretch(); session_info_layout.addWidget(self.active_rois_label); main_layout.addLayout(session_info_layout)
+        
+        session_info_layout = QHBoxLayout(); self.uptime_label = QLabel("Uptime: 0s"); self.active_rois_label = QLabel("Total ROIs: 0"); session_info_layout.addWidget(self.uptime_label); session_info_layout.addStretch(); session_info_layout.addWidget(self.active_rois_label); main_layout.addLayout(session_info_layout)
 
-        # --- Header Row for the new columns ---
-        header_widget = QWidget()
-        header_layout = QHBoxLayout(header_widget); header_layout.setContentsMargins(6, 3, 6, 3)
-        header_font = QFont("Arial", 9, QFont.Bold); header_font.setUnderline(True)
+        header_widget = QWidget(); header_layout = QHBoxLayout(header_widget); header_layout.setContentsMargins(6, 3, 6, 3); header_font = QFont("Arial", 9, QFont.Bold); header_font.setUnderline(True)
         col_labels = ["Region", "Status", "Duration", "Crit. Errors", "Purple", "Blue", "Grey"]
-        col_stretches = [4, 5, 2, 1, 1, 1, 1] # Stretch factors for columns
+        col_stretches = [4, 5, 2, 1, 1, 1, 1]
         for text, stretch in zip(col_labels, col_stretches):
             lbl = QLabel(text); lbl.setFont(header_font); header_layout.addWidget(lbl, stretch)
         main_layout.addWidget(header_widget)
 
-        # --- Scroll Area for sorted rows ---
         scroll_area = QScrollArea(); scroll_area.setWidgetResizable(True); scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.alert_container_widget = QWidget()
         self.alert_lines_layout = QVBoxLayout(self.alert_container_widget); self.alert_lines_layout.setContentsMargins(0, 0, 0, 0); self.alert_lines_layout.setSpacing(1); self.alert_lines_layout.addStretch()
@@ -208,194 +318,243 @@ class AlertWindow(QWidget):
         main_layout.addWidget(scroll_area, 1)
 
         self.update_timer = QTimer(self); self.update_timer.timeout.connect(self._update_session_info); self.update_timer.start(1000)
-        # NEW: Timer for flashing effect
-        self.flash_timer = QTimer(self); self.flash_timer.timeout.connect(self._handle_flashing); self.flash_timer.start(750) # Toggles every 750ms
-        self._flash_state = False
+        self.flash_timer = QTimer(self); self.flash_timer.timeout.connect(self._handle_flashing); self.flash_timer.start(750); self._flash_state = False
 
-    def _update_session_info(self): uptime_delta = datetime.now() - self.session_start_time; self.uptime_label.setText(f"Uptime: {str(uptime_delta).split('.')[0]}"); self.active_rois_label.setText(f"ROIs: {self.active_rois_count}")
-    
+    def _update_session_info(self):
+        uptime_delta = datetime.now() - self.session_start_time
+        self.uptime_label.setText(f"Uptime: {str(uptime_delta).split('.')[0]}")
+        self.active_rois_label.setText(f"Total ROIs: {len(self.all_region_statuses)}")
+
     def _handle_flashing(self):
-        self._flash_state = not self._flash_state # Toggle state
-        for title, status_obj in self.all_region_statuses.items():
-            if title in self.region_row_widgets:
-                row_widget = self.region_row_widgets[title]
-                is_over_time_limit = False
-                if status_obj.is_anomaly and status_obj.anomaly_start_time:
-                    duration = (datetime.now() - status_obj.anomaly_start_time).total_seconds()
-                    if duration > 150: # 2.5 minutes
-                        is_over_time_limit = True
-                
-                # Apply or remove flashing stylesheet
-                current_stylesheet = row_widget.styleSheet()
-                flash_style = "background-color: #581c1c;" # Dark red
-                
-                if is_over_time_limit:
-                    if self._flash_state:
-                        if flash_style not in current_stylesheet: row_widget.setStyleSheet(current_stylesheet + flash_style)
-                    else:
-                        if flash_style in current_stylesheet: row_widget.setStyleSheet(current_stylesheet.replace(flash_style, ""))
-                else: # Ensure flashing stops if duration is no longer over limit (or anomaly clears)
-                    if flash_style in current_stylesheet: row_widget.setStyleSheet(current_stylesheet.replace(flash_style, ""))
+        self._flash_state = not self._flash_state
+        for title, row_widget in self.region_row_widgets.items():
+            status_obj = self.all_region_statuses.get(title)
+            if not status_obj: continue
+            is_over_time = status_obj.is_anomaly and status_obj.anomaly_start_time and (datetime.now() - status_obj.anomaly_start_time).total_seconds() > 150
+            flash_style = "background-color: #581c1c;"
+            current_style = row_widget.styleSheet()
+            has_flash = flash_style in current_style
+            if is_over_time:
+                if self._flash_state and not has_flash: row_widget.setStyleSheet(current_style + flash_style)
+                elif not self._flash_state and has_flash: row_widget.setStyleSheet(current_style.replace(flash_style, ""))
+            elif has_flash: row_widget.setStyleSheet(current_style.replace(flash_style, ""))
 
     def position_window(self):
-        try: screen_geometry = QApplication.primaryScreen().geometry(); self.move(screen_geometry.width() - self.width() - 20, 30)
-        except Exception as e: logger.warning(f"Could not auto-position alert window: {e}"); self.move(300, 300)
+        try:
+            screen_geometry = QApplication.primaryScreen().geometry()
+            self.move(screen_geometry.width() - self.width() - 20, 30)
+        except Exception as e:
+            logger.warning(f"Could not auto-position alert window: {e}")
 
-    @pyqtSlot(float)
-    def update_overall_health(self, health_percentage: float):
-        self.conveyor_health = health_percentage; self.health_label.setText(f"Health: {self.conveyor_health:.1f}%"); self.health_progress_bar.setValue(int(self.conveyor_health))
-        stylesheet = "QProgressBar::chunk { background-color: %s; }"; color = "green"
-        if health_percentage < 40: color = "red"
-        elif health_percentage < 70: color = "orange"
+    @pyqtSlot(float, int)
+    def update_overall_health(self, health, active_anomalies):
+        self.health_label.setText(f"Health: {health:.1f}%")
+        self.health_progress_bar.setValue(int(health))
+        stylesheet = "QProgressBar::chunk{background-color:%s;}"; color = "green"
+        if health < 40: color = "red"
+        elif health < 70: color = "orange"
         self.health_progress_bar.setStyleSheet(stylesheet % color)
 
     @pyqtSlot(RegionStatus)
     def update_region_status(self, status: RegionStatus):
-        self.all_region_statuses[status.title] = status
-        self.active_rois_count = len(self.all_region_statuses)
-        self._redraw_all_rows()
-
-    def _redraw_all_rows(self):
-        # Clear existing layout
-        while self.alert_lines_layout.count() > 1: # Keep the stretch item
-            item = self.alert_lines_layout.takeAt(0)
-            if item and item.widget(): item.widget().deleteLater()
+        title = status.title
+        was_anomaly = self.all_region_statuses.get(title, RegionStatus(title, is_anomaly=False)).is_anomaly
+        self.all_region_statuses[title] = status
         
-        # Sort statuses by priority
-        sorted_statuses = sorted(self.all_region_statuses.values(), key=lambda s: COLOR_DEFINITIONS[s.get_primary_color_name()]["priority"])
+        # Logic to decide if a row should be added or removed
+        should_be_visible = status.is_anomaly or title in self.recently_cleared_queue
+        is_currently_visible = title in self.region_row_widgets
 
-        # Re-populate layout in sorted order
-        for status in sorted_statuses:
-            self._create_or_update_row(status)
+        # If an event clears, add it to the recently cleared queue
+        if was_anomaly and not status.is_anomaly:
+            if title in self.recently_cleared_queue:
+                self.recently_cleared_queue.remove(title) # Remove to re-add at the end
+            self.recently_cleared_queue.append(title)
 
-    def _create_or_update_row(self, status: RegionStatus):
-        # This method creates a single row widget and inserts it into the layout
-        # Since we redraw all, this logic can be simplified to just "create"
+        # Prune the oldest "cleared" event if the queue is full AND a new anomaly appears
+        # This prevents the list from shrinking while everything is nominal
+        if len(self.recently_cleared_queue) == self.MAX_RECENTLY_CLEARED_TO_SHOW and status.is_anomaly and not was_anomaly:
+             # The deque automatically handles pruning the oldest item when a new one is appended
+             pass
+
+        # Redraw the visible rows, which will handle adding/removing/updating
+        self._sort_and_redraw_visible_rows()
+
+    def _sort_and_redraw_visible_rows(self):
+        # Determine which statuses should be visible
+        visible_titles = {title for title, s in self.all_region_statuses.items() if s.is_anomaly}
+        visible_titles.update(self.recently_cleared_queue)
+
+        # Prune widgets that are no longer visible
+        for title in list(self.region_row_widgets.keys()):
+            if title not in visible_titles:
+                widget = self.region_row_widgets.pop(title)
+                widget.deleteLater()
+
+        # Get the actual status objects for visible ROIs and sort them
+        visible_statuses = [self.all_region_statuses[title] for title in visible_titles if title in self.all_region_statuses]
+        sorted_statuses = sorted(visible_statuses, key=lambda s: COLOR_DEFINITIONS[s.get_primary_color_name()]["priority"])
+
+        # Update the layout based on the sorted list
+        for i, status in enumerate(sorted_statuses):
+            self._create_or_update_row(status, i)
+
+    def _create_or_update_row(self, status: RegionStatus, position: int):
         title = status.title
         
-        line_widget = QWidget(); line_widget.setAutoFillBackground(True) # Needed for background color to work
-        line_layout = QHBoxLayout(line_widget); line_layout.setContentsMargins(6, 2, 6, 2); line_layout.setSpacing(10)
-        
-        font_small = QFont("Arial", 9); font_bold = QFont("Arial", 10, QFont.Bold)
-        
-        # Define columns with their respective data, stretch factor, and font
-        columns_data = [
-            (title, 4, font_bold),
-            (status.get_primary_color_message(), 5, font_small),
-            (f"Dur: {str(datetime.now() - status.anomaly_start_time).split('.')[0]}" if status.anomaly_start_time else "Dur: --", 2, font_small),
-            (str(status.critical_error_count), 1, font_small),
-            (str(status.purple_count), 1, font_small),
-            (str(status.blue_count), 1, font_small),
-            (str(status.grey_count), 1, font_small)
-        ]
-
-        for text, stretch, font in columns_data:
-            lbl = QLabel(text); lbl.setFont(font); lbl.setAlignment(Qt.AlignCenter)
-            if "Dur:" in text: lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            if text == title: lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            line_layout.addWidget(lbl, stretch)
-        
-        # Color the status message text
-        bgr_color = status.get_primary_bgr(); text_color = QColor(bgr_color[2], bgr_color[1], bgr_color[0])
-        status_label_widget = line_layout.itemAt(1).widget()
-        status_label_widget.setStyleSheet(f"color: {text_color.name()};" + ("font-weight: bold;" if status.is_anomaly else ""))
+        if title not in self.region_row_widgets:
+            line_widget = QWidget(); line_widget.setAutoFillBackground(True); line_layout = QHBoxLayout(line_widget); line_layout.setContentsMargins(6, 2, 6, 2); line_layout.setSpacing(10)
             
-        self.alert_lines_layout.insertWidget(self.alert_lines_layout.count()-1, line_widget) # Insert before the stretch
-        self.region_row_widgets[title] = line_widget # Track the row widget for flashing
+            font_small = QFont("Arial", 9); font_bold = QFont("Arial", 10, QFont.Bold)
+            
+            # Create all the labels for the row
+            labels = {
+                "title": QLabel(title), "status": QLabel(), "duration": QLabel(),
+                "critical": QLabel(), "purple": QLabel(), "blue": QLabel(), "grey": QLabel()
+            }
+            labels["title"].setFont(font_bold); labels["title"].setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            for key in ["status", "duration", "critical", "purple", "blue", "grey"]: labels[key].setFont(font_small); labels[key].setAlignment(Qt.AlignCenter)
+            
+            line_layout.addWidget(labels["title"], 4); line_layout.addWidget(labels["status"], 5); line_layout.addWidget(labels["duration"], 2); line_layout.addWidget(labels["critical"], 1); line_layout.addWidget(labels["purple"], 1); line_layout.addWidget(labels["blue"], 1); line_layout.addWidget(labels["grey"], 1)
+            
+            self.alert_lines_layout.insertWidget(position, line_widget)
+            self.region_row_widgets[title] = line_widget
+            line_widget.setProperty("labels", labels) # Store labels with the widget
+        
+        # Update the content of the labels
+        widget = self.region_row_widgets[title]
+        labels = widget.property("labels")
 
+        labels["status"].setText(status.get_primary_color_message())
+        labels["duration"].setText(f"Dur: {str(datetime.now() - status.anomaly_start_time).split('.')[0]}" if status.anomaly_start_time else "Dur: --")
+        labels["critical"].setText(str(status.critical_error_count))
+        labels["purple"].setText(str(status.purple_count))
+        labels["blue"].setText(str(status.blue_count))
+        labels["grey"].setText(str(status.grey_count))
+        
+        # Update colors
+        bgr_color = status.get_primary_bgr(); text_color = QColor(bgr_color[2], bgr_color[1], bgr_color[0])
+        labels["status"].setStyleSheet(f"color: {text_color.name()};" + ("font-weight: bold;" if status.is_anomaly else ""))
+        labels["duration"].setStyleSheet(f"color: {'#f0f0f0' if status.is_anomaly else '#888'};")
+        
     def remove_region(self, title: str):
         if title in self.all_region_statuses: del self.all_region_statuses[title]
-        self._redraw_all_rows()
+        if title in self.region_row_widgets: self.region_row_widgets.pop(title).deleteLater()
+        if title in self.recently_cleared_queue: self.recently_cleared_queue.remove(title)
+        self._sort_and_redraw_visible_rows()
 
     def clear_all_regions(self):
-        self.all_region_statuses.clear(); self._redraw_all_rows()
+        self.all_region_statuses.clear(); self.recently_cleared_queue.clear()
+        for widget in self.region_row_widgets.values(): widget.deleteLater()
+        self.region_row_widgets.clear()
         
-    def closeEvent(self, event): self.update_timer.stop(); self.flash_timer.stop(); super().closeEvent(event)
+    def closeEvent(self, event):
+        self.update_timer.stop(); self.flash_timer.stop(); super().closeEvent(event)
 
 
+class ReportingDashboard(QMainWindow):
+    def __init__(self, data_logger: DataLogger, parent: Optional[QWidget] = None):
+        super().__init__(parent); self.data_logger = data_logger; self.setWindowTitle("VICE - Reporting & Analysis"); self.setGeometry(150, 150, 1600, 900); self.initUI()
+    def initUI(self):
+        main_widget = QWidget(); self.setCentralWidget(main_widget); main_layout = QVBoxLayout(main_widget)
+        control_bar = QHBoxLayout(); self.start_dt_edit = QDateTimeEdit(QDateTime.currentDateTime().addDays(-1)); self.end_dt_edit = QDateTimeEdit(QDateTime.currentDateTime()); refresh_btn = QPushButton("Load Data")
+        control_bar.addWidget(QLabel("From:")); control_bar.addWidget(self.start_dt_edit); control_bar.addWidget(QLabel("To:")); control_bar.addWidget(self.end_dt_edit); control_bar.addWidget(refresh_btn); control_bar.addStretch()
+        main_layout.addLayout(control_bar)
+        splitter = QSplitter(Qt.Horizontal); main_layout.addWidget(splitter)
+        left_panel = QFrame(); left_panel.setFrameShape(QFrame.StyledPanel); left_layout = QVBoxLayout(left_panel)
+        kpi_group = QGroupBox("Key Performance Indicators (KPIs)"); kpi_layout = QGridLayout(kpi_group)
+        self.kpi_labels = {"downtime":QLabel("N/A"), "mtbf":QLabel("N/A"), "mttr":QLabel("N/A"), "failures":QLabel("N/A")}
+        kpi_layout.addWidget(QLabel("<b>Total Downtime:</b>"), 0, 0); kpi_layout.addWidget(self.kpi_labels["downtime"], 0, 1); kpi_layout.addWidget(QLabel("<b>MTBF (Hours):</b>"), 1, 0); kpi_layout.addWidget(self.kpi_labels["mtbf"], 1, 1); kpi_layout.addWidget(QLabel("<b>MTTR (Seconds):</b>"), 2, 0); kpi_layout.addWidget(self.kpi_labels["mttr"], 2, 1); kpi_layout.addWidget(QLabel("<b>Failure Count:</b>"), 3, 0); kpi_layout.addWidget(self.kpi_labels["failures"], 3, 1)
+        left_layout.addWidget(kpi_group)
+        pareto_group = QGroupBox("Top 5 Downtime Contributors"); pareto_layout = QVBoxLayout(pareto_group)
+        self.pareto_table = QTableWidget(5, 2); self.pareto_table.setHorizontalHeaderLabels(["ROI", "Total Downtime (s)"]); self.pareto_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        pareto_layout.addWidget(self.pareto_table); left_layout.addWidget(pareto_group); splitter.addWidget(left_panel)
+        right_panel = QFrame(); right_panel.setFrameShape(QFrame.StyledPanel); right_layout = QVBoxLayout(right_panel)
+        health_group = QGroupBox("Conveyor Health Over Time"); health_layout = QVBoxLayout(health_group)
+        self.health_plot = pg.PlotWidget(); self.health_plot.setLabel('left', 'Health %', units='%'); self.health_plot.setLabel('bottom', 'Time'); self.health_plot.setAxisItems({'bottom': pg.DateAxisItem()}); self.health_plot.showGrid(x=True, y=True, alpha=0.3)
+        health_layout.addWidget(self.health_plot); right_layout.addWidget(health_group); splitter.addWidget(right_panel); splitter.setSizes([600, 1000])
+        refresh_btn.clicked.connect(self.refresh_data); self.refresh_data()
+    def refresh_data(self): self.load_report_data(self.start_dt_edit.dateTime().toPyDateTime(), self.end_dt_edit.dateTime().toPyDateTime())
+    def load_report_data(self, start_dt, end_dt):
+        kpis = self.data_logger.get_kpi_metrics(start_dt, end_dt)
+        self.kpi_labels["downtime"].setText(f"{timedelta(seconds=int(kpis.get('total_downtime', 0)))}")
+        mtbf_val = kpis.get('mtbf'); self.kpi_labels["mtbf"].setText(f"{mtbf_val / 3600:.2f}" if isinstance(mtbf_val, (int, float)) else "N/A")
+        mttr_val = kpis.get('mttr'); self.kpi_labels["mttr"].setText(f"{mttr_val:.2f}" if isinstance(mttr_val, (int, float)) else "N/A")
+        self.kpi_labels["failures"].setText(f"{kpis.get('failure_count', 'N/A')}")
+        pareto_data = self.data_logger.get_pareto_analysis(start_dt, end_dt); self.pareto_table.setRowCount(len(pareto_data));
+        for row, item in enumerate(pareto_data): self.pareto_table.setItem(row, 0, QTableWidgetItem(item["roi"])); self.pareto_table.setItem(row, 1, QTableWidgetItem(f"{item['duration']:.2f}"))
+        health_data = self.data_logger.get_health_snapshots(start_dt, end_dt); self.health_plot.clear()
+        if health_data:
+            timestamps = [datetime.fromisoformat(d['timestamp']).timestamp() for d in health_data]; health_values = [d['health'] for d in health_data]
+            self.health_plot.plot(timestamps, health_values, pen='b')
 
-# --- (Located in the Core Application Classes section) ---
+
 class AnomalyDetector(QObject):
     new_region_status = pyqtSignal(RegionStatus)
     metrics_update_for_logging = pyqtSignal(dict)
-    anomaly_ended = pyqtSignal(str, str, datetime, datetime)
-
-    def __init__(self, parent: Optional[QObject] = None):
-        super().__init__(parent); self.rois = {}; self.running = False; self.sct = None; self.monitor_thread = None
-        self.resolution_scale_factor = RESOLUTION_SCALE_DEFAULT / 100.0; self.capture_interval_sec = CAPTURE_INTERVAL_DEFAULT
-        self.detection_mode_all_colors = False; self._current_roi_statuses = {}
-
+    anomaly_ended = pyqtSignal(dict) # Emits a dict payload
+    
+    def __init__(self, parent=None):
+        super().__init__(parent); self.rois={}; self.running=False; self.sct=None; self.monitor_thread=None; self.resolution_scale_factor=RESOLUTION_SCALE_DEFAULT/100.0; self.capture_interval_sec=CAPTURE_INTERVAL_DEFAULT; self.detection_mode_all_colors=False; self._current_roi_statuses={}
+    
     def update_config(self, rois, res, interval, all_colors):
-        self.rois = rois; self.resolution_scale_factor = max(0.1, min(1.0, res / 100.0))
-        self.capture_interval_sec = max(0.05, interval); self.detection_mode_all_colors = all_colors
-        new_statuses = {title: self._current_roi_statuses.get(title, RegionStatus(title=title)) for title in rois}
-        self._current_roi_statuses = new_statuses
-
-    def _capture_single_roi(self, roi_info):
+        self.rois=rois; self.resolution_scale_factor=max(0.1,min(1.0,res/100.0)); self.capture_interval_sec=max(0.05,interval); self.detection_mode_all_colors=all_colors; self._current_roi_statuses={t:self._current_roi_statuses.get(t,RegionStatus(t)) for t in rois}
+    
+    def _capture(self, roi_info):
         if not self.sct: return None
         try:
             mon = {"top": roi_info.monitor_info["top"] + roi_info.roi[1], "left": roi_info.monitor_info["left"] + roi_info.roi[0], "width": roi_info.roi[2], "height": roi_info.roi[3]}
             if mon["width"] <= 0 or mon["height"] <= 0: return None
             img = np.array(self.sct.grab(mon)); img_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-            if self.resolution_scale_factor < 1.0:
-                return cv2.resize(img_bgr, (0, 0), fx=self.resolution_scale_factor, fy=self.resolution_scale_factor, interpolation=cv2.INTER_AREA)
-            return img_bgr
-        except Exception as e: logger.error(f"Capture error for '{roi_info.title}': {e}"); return None
+            return cv2.resize(img_bgr, (0,0), fx=self.resolution_scale_factor, fy=self.resolution_scale_factor, interpolation=cv2.INTER_AREA) if self.resolution_scale_factor<1.0 else img_bgr
+        except Exception: return None
 
-    def _detect_colors_in_single_frame(self, image):
-        if image is None: return []
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV); detected = []
-        for name, props in COLOR_DEFINITIONS.items():
+    def _detect(self, img):
+        if img is None: return []
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV); detected = []
+        for name, p in COLOR_DEFINITIONS.items():
             if name == "green": continue
             if not self.detection_mode_all_colors and name not in ["orange", "red", "grey"]: continue
-            mask = None
-            if isinstance(props.get("lower"), list):
-                mask = cv2.bitwise_or(cv2.inRange(hsv, props["lower"][0], props["upper"][0]), cv2.inRange(hsv, props["lower"][1], props["upper"][1]))
-            else: mask = cv2.inRange(hsv, props["lower"], props["upper"])
-            if np.sum(mask > 0) / mask.size * 100 >= props["threshold_percent"]:
-                detected.append(DetectedColorInfo(name=name, bgr=props["bgr"], message=props["message"]))
-        detected.sort(key=lambda dci: list(COLOR_DEFINITIONS.keys()).index(dci.name))
-        return detected
-
-    def _monitoring_loop(self):
+            mask = cv2.bitwise_or(cv2.inRange(hsv, p["lower"][0], p["upper"][0]), cv2.inRange(hsv, p["lower"][1], p["upper"][1])) if isinstance(p.get("lower"), list) else cv2.inRange(hsv, p["lower"], p["upper"])
+            if np.sum(mask > 0) / mask.size * 100 >= p["threshold_percent"]: detected.append(DetectedColorInfo(name,p["bgr"],p["message"]))
+        detected.sort(key=lambda d: list(COLOR_DEFINITIONS.keys()).index(d.name)); return detected
+    
+    def _loop(self):
         try:
             self.sct = mss(); logger.info("Monitoring loop started.")
             while self.running:
                 scan_time = datetime.now(); loop_start = time.perf_counter(); statuses_for_metrics = {}
                 for title, roi_info in list(self.rois.items()):
                     if not self.running: break
-                    status_obj = self._current_roi_statuses[title]; was_anomaly = status_obj.is_anomaly
-                    prev_primary_color = status_obj.get_primary_color_name(); prev_start_time = status_obj.anomaly_start_time
-                    img = self._capture_single_roi(roi_info); frame_colors = self._detect_colors_in_single_frame(img); del img
+                    status, was_anomaly = self._current_roi_statuses[title], self._current_roi_statuses[title].is_anomaly
+                    prev_primary, prev_start = status.get_primary_color_name(), status.anomaly_start_time; prev_secondary = [c.name for c in status.detected_colors[1:]]
+                    img = self._capture(roi_info); frame_colors = self._detect(img); del img
                     persistent_colors = []
                     for name, props in COLOR_DEFINITIONS.items():
                         if name == "green": continue
-                        color_in_frame = next((dci for dci in frame_colors if dci.name == name), None)
-                        if color_in_frame:
-                            status_obj._blink_color_last_physical_detection_time[name] = scan_time
-                            persistent_colors.append(color_in_frame)
+                        color_in_frame = next((d for d in frame_colors if d.name == name), None)
+                        if color_in_frame: status._blink_color_last_physical_detection_time[name] = scan_time; persistent_colors.append(color_in_frame)
                         elif props.get("is_blinking", False):
-                            last_seen = status_obj._blink_color_last_physical_detection_time.get(name)
-                            if last_seen and (scan_time - last_seen).total_seconds() < BLINK_GRACE_PERIOD_SECONDS:
-                                persistent_colors.append(DetectedColorInfo(name=name, bgr=props["bgr"], message=props["message"]))
-                            else: status_obj._blink_color_last_physical_detection_time[name] = None
-                    persistent_colors.sort(key=lambda dci: list(COLOR_DEFINITIONS.keys()).index(dci.name))
-                    status_obj.detected_colors = persistent_colors; is_now_anomaly = bool(persistent_colors)
+                            last_seen = status._blink_color_last_physical_detection_time.get(name)
+                            if last_seen and (scan_time - last_seen).total_seconds() < BLINK_GRACE_PERIOD_SECONDS: persistent_colors.append(DetectedColorInfo(name, props["bgr"], props["message"]))
+                            else: status._blink_color_last_physical_detection_time[name] = None
+                    persistent_colors.sort(key=lambda d: list(COLOR_DEFINITIONS.keys()).index(d.name))
+                    status.detected_colors = persistent_colors; is_now_anomaly = bool(persistent_colors)
                     if is_now_anomaly and not was_anomaly:
-                        status_obj.is_anomaly = True; status_obj.anomaly_start_time = scan_time
-                        # NEW: Increment correct counter on transition to anomaly
-                        primary_color = status_obj.get_primary_color_name()
-                        if primary_color in ["red", "orange"]: status_obj.critical_error_count += 1
-                        elif primary_color == "purple": status_obj.purple_count += 1
-                        elif primary_color == "blue": status_obj.blue_count += 1
-                        elif primary_color == "grey": status_obj.grey_count += 1
+                        status.is_anomaly = True; status.anomaly_start_time = scan_time
+                        p_color = status.get_primary_color_name()
+                        if p_color in ["red", "orange"]: status.critical_error_count += 1
+                        elif p_color == "purple": status.purple_count += 1
+                        elif p_color == "blue": status.blue_count += 1
+                        elif p_color == "grey": status.grey_count += 1
                     elif not is_now_anomaly and was_anomaly:
-                        status_obj.is_anomaly = False; status_obj.anomaly_start_time = None
-                        if prev_primary_color and prev_start_time: self.anomaly_ended.emit(title, prev_primary_color, prev_start_time, scan_time)
-                    else: status_obj.is_anomaly = is_now_anomaly
-                    self.new_region_status.emit(status_obj)
-                    statuses_for_metrics[title] = {"title": status_obj.title, "is_anomaly": status_obj.is_anomaly, "detected_colors": [vars(dci) for dci in status_obj.detected_colors], "anomaly_start_time": status_obj.anomaly_start_time.isoformat() if status_obj.anomaly_start_time else None, "jam_count": status_obj.critical_error_count} # Note: jam_count is now critical_error_count
-                self.metrics_update_for_logging.emit({"timestamp": scan_time, "roi_statuses": statuses_for_metrics, "num_rois": len(self.rois)})
+                        status.is_anomaly = False; status.anomaly_start_time = None
+                        if prev_primary and prev_start:
+                            payload = {"roi_title": title, "primary_event_type_name": prev_primary, "event_type": COLOR_DEFINITIONS[prev_primary]['message'], "start_time": prev_start, "end_time": scan_time, "duration": (scan_time - prev_start).total_seconds(), "secondary_colors": prev_secondary}
+                            self.anomaly_ended.emit(payload)
+                    self.new_region_status.emit(status)
+                    statuses_for_metrics[title] = {"is_anomaly": status.is_anomaly, "detected_colors": [vars(d) for d in status.detected_colors], "start_time": status.anomaly_start_time.isoformat() if status.anomaly_start_time else None}
+                self.metrics_update_for_logging.emit({"timestamp": scan_time, "statuses": statuses_for_metrics})
                 time.sleep(max(0, self.capture_interval_sec - (time.perf_counter() - loop_start)))
         except Exception as e: logger.exception("CRITICAL ERROR in monitoring loop:")
         finally:
@@ -404,163 +563,30 @@ class AnomalyDetector(QObject):
 
     def start(self):
         if self.running: return
-        for status in self._current_roi_statuses.values(): status._blink_color_last_physical_detection_time.clear()
-        self.running = True; self.monitor_thread = threading.Thread(target=self._monitoring_loop, name="AnomalyDetectorThread", daemon=True); self.monitor_thread.start()
-
+        for s in self._current_roi_statuses.values(): s._blink_color_last_physical_detection_time.clear()
+        self.running = True; self.monitor_thread = threading.Thread(target=self._loop, daemon=True); self.monitor_thread.start()
     def stop(self):
         self.running = False
-        if self.monitor_thread and self.monitor_thread.is_alive(): self.monitor_thread.join(timeout=(self.capture_interval_sec * 2) + BLINK_GRACE_PERIOD_SECONDS + 0.5)
-        self.monitor_thread = None
-        for status_obj in self._current_roi_statuses.values():
-            if status_obj.is_anomaly:
-                status_obj.is_anomaly = False; status_obj.detected_colors = []; status_obj.anomaly_start_time = None
-                self.new_region_status.emit(status_obj)
+        if self.monitor_thread and self.monitor_thread.is_alive(): self.monitor_thread.join(timeout=3.0)
+        for s in self._current_roi_statuses.values():
+            if s.is_anomaly: s.is_anomaly=False; s.detected_colors=[]; s.anomaly_start_time=None; self.new_region_status.emit(s)
 
-# --- Conveyor Metrics Calculation ---
 
 class ConveyorMetrics(QObject):
-    overall_health_updated = pyqtSignal(float)
-    metrics_for_api_and_dashboard = pyqtSignal(dict)
-
-    def __init__(self, parent: Optional[QObject] = None):
-        super().__init__(parent)
-        self.start_time = datetime.now()
-        self.num_rois = 0
-        self.current_conveyor_health = 100.0
-        # This will store cumulative counts of primary anomaly colors for the session
-        self.session_primary_color_anomaly_counts: Dict[str, int] = defaultdict(int)
-
+    health_updated = pyqtSignal(float, int)
     @pyqtSlot(dict)
-    def process_metrics_from_detector(self, payload: dict):
-        timestamp_dt = payload["timestamp"] 
-        roi_statuses_data: Dict[str, Dict] = payload["roi_statuses"] 
-        self.num_rois = payload["num_rois"]
+    def process_metrics(self, data):
+        num_rois = len(data["statuses"])
+        if not num_rois: self.health_updated.emit(100.0, 0); return
+        impact, active_anomalies = 0.0, 0
+        for s in data["statuses"].values():
+            if s["is_anomaly"] and s["detected_colors"]:
+                active_anomalies += 1
+                p_color = s["detected_colors"][0]["name"]
+                impact += COLOR_DEFINITIONS[p_color].get("weight", 0.0)
+        health = max(0.0, 100.0 - (impact / num_rois * 100.0))
+        self.health_updated.emit(health, active_anomalies)
 
-        if not self.num_rois:
-            self.current_conveyor_health = 100.0
-            self.overall_health_updated.emit(self.current_conveyor_health)
-            # self.session_primary_color_anomaly_counts.clear() # Optionally reset if no ROIs
-            return
-
-        active_jam_titles = []
-        
-        # Update session_primary_color_anomaly_counts based on current debounced states
-        # This needs to be based on *transitions* into an anomaly state with a primary color,
-        # or count how many ROIs are *currently* in an anomaly state with a given primary color.
-        # For now, let's count ROIs currently showing a primary color anomaly.
-        current_cycle_primary_color_counts: Dict[str, int] = defaultdict(int)
-
-        for title, status_dict in roi_statuses_data.items():
-            if status_dict["is_anomaly"]: # is_anomaly is the debounced state
-                active_jam_titles.append(title)
-                if status_dict["detected_colors"]: # This is the debounced list of color dicts
-                    primary_color_name = status_dict["detected_colors"][0]["name"]
-                    current_cycle_primary_color_counts[primary_color_name] += 1
-        
-        # If session_primary_color_anomaly_counts is meant to be a sum over time of how many
-        # *frames* a color was primary, then this update is different.
-        # Based on original intent, it seemed like a cumulative count of detection events.
-        # Let's stick to incrementing for now, assuming each processing cycle is an "event".
-        for color, count in current_cycle_primary_color_counts.items():
-            self.session_primary_color_anomaly_counts[color] += count
-
-
-        self._calculate_conveyor_health(roi_statuses_data)
-        self.overall_health_updated.emit(self.current_conveyor_health)
-
-        uptime_seconds = (datetime.now() - self.start_time).total_seconds()
-        api_metrics = {
-            "timestamp": timestamp_dt.isoformat(),
-            "conveyor_health": self.current_conveyor_health,
-            "active_rois": self.num_rois,
-            "active_jams_count": len(active_jam_titles),
-            "active_jam_rois": active_jam_titles,
-            "uptime_seconds": uptime_seconds,
-            "color_event_counts": dict(self.session_primary_color_anomaly_counts), 
-        }
-        self.metrics_for_api_and_dashboard.emit(api_metrics)
-
-    def _calculate_conveyor_health(self, roi_statuses_data: Dict[str, Dict]):
-        if not self.num_rois:
-            self.current_conveyor_health = 100.0
-            return
-
-        total_weighted_impact_sum = 0.0
-        
-        for title, status_dict in roi_statuses_data.items():
-            # status_dict["is_anomaly"] is the debounced state
-            if status_dict["is_anomaly"] and status_dict["detected_colors"]:
-                # Primary color from the debounced list determines the weight
-                primary_color_info = status_dict["detected_colors"][0] 
-                primary_color_name = primary_color_info["name"]
-                
-                if primary_color_name in COLOR_DEFINITIONS:
-                    color_props = COLOR_DEFINITIONS[primary_color_name]
-                    total_weighted_impact_sum += color_props.get("weight", 0.0)
-        
-        if self.num_rois > 0:
-            average_impact_factor = total_weighted_impact_sum / self.num_rois
-            self.current_conveyor_health = max(0.0, min(100.0, 100.0 - (average_impact_factor * 100.0)))
-        else:
-            self.current_conveyor_health = 100.0
-        
-        # logger.debug(f"Health: {self.current_conveyor_health:.1f}% (Total Impact Sum: {total_weighted_impact_sum:.2f}, Avg Factor: {average_impact_factor:.2f})")
-
-
-class DataLogger(QObject):
-    def __init__(self, db_path: Path, parent: Optional[QObject] = None):
-        super().__init__(parent); self.db_path = db_path; self._init_db_lock = threading.Lock(); self._initialize_database()
-    def _initialize_database(self):
-        with self._init_db_lock:
-            try:
-                with sqlite3.connect(self.db_path, detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES) as conn:
-                    cursor=conn.cursor()
-                    cursor.execute("CREATE TABLE IF NOT EXISTS conveyor_log (id INTEGER PRIMARY KEY, timestamp DATETIME, conveyor_health REAL, active_rois INTEGER, active_jams_count INTEGER, active_jam_rois TEXT, uptime_seconds REAL, color_event_counts TEXT)")
-                    cursor.execute("CREATE TABLE IF NOT EXISTS completed_events (id INTEGER PRIMARY KEY, roi_title TEXT, event_type TEXT, start_time DATETIME, end_time DATETIME, duration_seconds REAL)")
-                    conn.commit()
-            except sqlite3.Error as e: logger.exception(f"DB init error: {e}")
-    @pyqtSlot(str, str, datetime, datetime)
-    def log_completed_event(self, title, color, start, end):
-        if color not in ["red", "orange"]: return
-        duration = (end - start).total_seconds(); event_type = COLOR_DEFINITIONS.get(color, {}).get("message", "UNKNOWN")
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("INSERT INTO completed_events (roi_title, event_type, start_time, end_time, duration_seconds) VALUES (?, ?, ?, ?, ?)", (title, event_type, start, end, duration))
-        except Exception as e: logger.error(f"Log completed event error: {e}")
-    @pyqtSlot(dict)
-    def log_conveyor_metrics(self, data):
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("INSERT INTO conveyor_log (timestamp, conveyor_health, active_rois, active_jams_count, active_jam_rois, uptime_seconds, color_event_counts) VALUES (?, ?, ?, ?, ?, ?, ?)", (data["timestamp"], data["conveyor_health"], data["active_rois"], data["active_jams_count"], json.dumps(data["active_jam_rois"]), data["uptime_seconds"], json.dumps(data["color_event_counts"])))
-        except Exception as e: logger.error(f"Log conveyor metrics error: {e}")
-    def get_latest_metrics(self):
-        try:
-            with sqlite3.connect(self.db_path, detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES) as conn:
-                row = conn.execute("SELECT timestamp, conveyor_health, active_rois, active_jams_count, active_jam_rois, uptime_seconds, color_event_counts FROM conveyor_log ORDER BY timestamp DESC LIMIT 1").fetchone()
-                if row:
-                    return {
-                        "timestamp": row[0].isoformat(), # FIX: Convert datetime to string
-                        "conveyor_health": row[1],
-                        "active_rois": row[2],
-                        "active_jams_count": row[3],
-                        "active_jam_rois": json.loads(row[4] or '[]'),
-                        "uptime_seconds": row[5],
-                        "color_event_counts": json.loads(row[6] or '{}')
-                    }
-        except Exception as e: logger.error(f"DB get_latest_metrics error: {e}"); return None
-    def get_completed_events(self, limit=50):
-        try:
-            with sqlite3.connect(self.db_path, detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES) as conn:
-                rows = conn.execute("SELECT roi_title, event_type, end_time, duration_seconds FROM completed_events ORDER BY end_time DESC LIMIT ?", (limit,)).fetchall()
-                return [{"roi_title": r[0], "event_type": r[1], "end_time": r[2].isoformat(), "duration_seconds": r[3]} for r in rows] # FIX: Convert datetime to string
-        except Exception as e: logger.error(f"DB get_completed_events error: {e}"); return []
-    def get_hourly_summary(self):
-        try:
-            with sqlite3.connect(self.db_path, detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES) as conn:
-                query = "SELECT strftime('%Y-%m-%d %H:00:00', end_time) as hour, event_type, COUNT(*) as count FROM completed_events WHERE end_time >= ? GROUP BY hour, event_type ORDER BY hour"
-                df = pd.read_sql_query(query, conn, params=(datetime.now() - timedelta(hours=24),))
-                if not df.empty: return df.pivot(index='hour', columns='event_type', values='count').fillna(0).reset_index().to_dict('records')
-        except Exception as e: logger.error(f"DB get_hourly_summary error: {e}"); return []
 
 class FlaskAppWrapper(QThread):
     #FIX: Signals must be defined at the class level
@@ -593,183 +619,6 @@ class FlaskAppWrapper(QThread):
         if self.isRunning(): self.quit(); self.wait(2000)
 
 
-class MainApplicationWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.rois = {}
-        self.monitoring_active_flag = False
-        # FIX: Initialize attribute before initUI is called
-        self.detection_mode_all_colors = False 
-        
-        self.alert_window = AlertWindow()
-        self.anomaly_detector = AnomalyDetector()
-        self.conveyor_metrics = ConveyorMetrics()
-        self.data_logger = DataLogger(DB_PATH)
-        self.metrics_dashboard_window = None
-        self.flask_api_thread = None
-        
-        self.initUI()
-        self.connect_signals()
-        self.load_settings()
-        
-        self.resource_timer = QTimer(self)
-        self.resource_timer.timeout.connect(self.update_resource_usage)
-        self.resource_timer.start(2000)
-        
-        self.clock_timer = QTimer(self)
-        self.clock_timer.timeout.connect(self.update_clock)
-        self.clock_timer.start(1000)
-        
-        self.start_flask_api()
-
-    def initUI(self):
-        self.setWindowTitle(APP_NAME); self.setGeometry(100, 100, 600, 750); central_widget = QWidget(); self.setCentralWidget(central_widget); main_layout = QVBoxLayout(central_widget)
-        controls_group = QGroupBox("Controls"); controls_layout = QVBoxLayout(); resource_layout = QHBoxLayout(); self.cpu_label = QLabel("CPU: --%"); self.memory_label = QLabel("Mem: --%"); resource_layout.addWidget(self.cpu_label); resource_layout.addWidget(self.memory_label); controls_layout.addLayout(resource_layout); roi_buttons_layout = QGridLayout(); self.add_roi_btn = QPushButton(get_standard_icon(QStyle.SP_FileDialogNewFolder), " Add ROI"); self.delete_roi_btn = QPushButton(get_standard_icon(QStyle.SP_DialogDiscardButton), " Delete ROI"); self.clear_rois_btn = QPushButton(get_standard_icon(QStyle.SP_TrashIcon), " Clear All ROIs"); roi_buttons_layout.addWidget(self.add_roi_btn, 0, 0); roi_buttons_layout.addWidget(self.delete_roi_btn, 0, 1); roi_buttons_layout.addWidget(self.clear_rois_btn, 0, 2); controls_layout.addLayout(roi_buttons_layout); saveload_buttons_layout = QHBoxLayout(); self.save_rois_btn = QPushButton(get_standard_icon(QStyle.SP_DialogSaveButton), " Save ROIs"); self.load_rois_btn = QPushButton(get_standard_icon(QStyle.SP_DialogOpenButton), " Load ROIs"); saveload_buttons_layout.addWidget(self.save_rois_btn); saveload_buttons_layout.addWidget(self.load_rois_btn); controls_layout.addLayout(saveload_buttons_layout); controls_group.setLayout(controls_layout); main_layout.addWidget(controls_group)
-        regions_group = QGroupBox("Monitored Regions"); regions_layout = QVBoxLayout(); self.roi_list_widget = QListWidget(); self.roi_list_widget.setContextMenuPolicy(Qt.CustomContextMenu); regions_layout.addWidget(self.roi_list_widget); regions_group.setLayout(regions_layout); main_layout.addWidget(regions_group)
-        settings_group = QGroupBox("Settings"); settings_layout = QGridLayout(); settings_layout.addWidget(QLabel("Resolution Scale:"), 0, 0); self.resolution_slider = QSlider(Qt.Horizontal); self.resolution_slider.setRange(10, 100); self.resolution_slider.setValue(RESOLUTION_SCALE_DEFAULT); self.resolution_value_label = QLabel(f"{RESOLUTION_SCALE_DEFAULT/100.0:.2f}"); resolution_hbox = QHBoxLayout(); resolution_hbox.addWidget(self.resolution_slider); resolution_hbox.addWidget(self.resolution_value_label); settings_layout.addLayout(resolution_hbox, 0, 1, 1, 2); settings_layout.addWidget(QLabel("Capture Interval (s):"), 1, 0); self.interval_spinbox = QDoubleSpinBox(); self.interval_spinbox.setRange(0.1, 10.0); self.interval_spinbox.setValue(CAPTURE_INTERVAL_DEFAULT); self.interval_spinbox.setSingleStep(0.1); settings_layout.addWidget(self.interval_spinbox, 1, 1, 1, 2); settings_layout.addWidget(QLabel("Detection Mode:"), 2, 0); self.jams_only_radio = QRadioButton("Jams Only"); self.all_colors_radio = QRadioButton("All Colors"); self.jams_only_radio.setChecked(not self.detection_mode_all_colors); self.all_colors_radio.setChecked(self.detection_mode_all_colors); detection_mode_hbox = QHBoxLayout(); detection_mode_hbox.addWidget(self.jams_only_radio); detection_mode_hbox.addWidget(self.all_colors_radio); settings_layout.addLayout(detection_mode_hbox, 2, 1, 1, 2); settings_layout.addWidget(QLabel("System Time:"), 3, 0); self.clock_label = QLabel("--:--:--"); self.clock_label.setFont(QFont("Arial", 10, QFont.Bold)); settings_layout.addWidget(self.clock_label, 3, 1); schedule_group = QGroupBox("Auto Monitoring"); schedule_layout = QGridLayout(schedule_group); self.schedule_enabled_check = QCheckBox("Enable Auto Start/Stop"); schedule_layout.addWidget(self.schedule_enabled_check, 0, 0, 1, 2); schedule_layout.addWidget(QLabel("Stop Between:"), 1, 0); self.stop_start_hour_spin = QSpinBox(); self.stop_start_hour_spin.setRange(0,23); self.stop_start_hour_spin.setValue(17); schedule_layout.addWidget(self.stop_start_hour_spin, 1, 1); schedule_layout.addWidget(QLabel("and:"), 2, 0); self.stop_end_hour_spin = QSpinBox(); self.stop_end_hour_spin.setRange(0,23); self.stop_end_hour_spin.setValue(9); schedule_layout.addWidget(self.stop_end_hour_spin, 2, 1); settings_layout.addWidget(schedule_group, 4,0,1,3); settings_group.setLayout(settings_layout); main_layout.addWidget(settings_group); main_layout.addStretch(1)
-        monitoring_buttons_layout = QHBoxLayout(); self.start_monitor_btn = QPushButton(get_standard_icon(QStyle.SP_MediaPlay), " Start"); self.stop_monitor_btn = QPushButton(get_standard_icon(QStyle.SP_MediaStop), " Stop"); self.metrics_dashboard_btn = QPushButton(get_standard_icon(QStyle.SP_DialogHelpButton), " Metrics"); self.web_dashboard_btn = QPushButton(get_standard_icon(QStyle.SP_ComputerIcon), " Web Report"); monitoring_buttons_layout.addWidget(self.start_monitor_btn); monitoring_buttons_layout.addWidget(self.stop_monitor_btn); monitoring_buttons_layout.addWidget(self.metrics_dashboard_btn); monitoring_buttons_layout.addWidget(self.web_dashboard_btn); main_layout.addLayout(monitoring_buttons_layout)
-        self.status_bar = QStatusBar(); self.setStatusBar(self.status_bar); self.status_bar.showMessage("Ready."); self.update_control_states()
-    
-    def connect_signals(self):
-        self.add_roi_btn.clicked.connect(self.add_new_roi); self.delete_roi_btn.clicked.connect(self.delete_selected_roi); self.clear_rois_btn.clicked.connect(self.clear_all_rois_confirmed); self.save_rois_btn.clicked.connect(self.save_rois_to_file); self.load_rois_btn.clicked.connect(self.load_rois_from_file); self.roi_list_widget.customContextMenuRequested.connect(self.show_roi_context_menu); self.roi_list_widget.itemDoubleClicked.connect(self.rename_selected_roi); self.resolution_slider.valueChanged.connect(self.update_resolution_label); self.start_monitor_btn.clicked.connect(self.start_monitoring_session); self.stop_monitor_btn.clicked.connect(self.stop_monitoring_session); self.metrics_dashboard_btn.clicked.connect(self.show_metrics_dashboard); self.web_dashboard_btn.clicked.connect(self.open_web_dashboard)
-        self.anomaly_detector.anomaly_ended.connect(self.data_logger.log_completed_event); self.anomaly_detector.new_region_status.connect(self.alert_window.update_region_status); self.anomaly_detector.metrics_update_for_logging.connect(self.conveyor_metrics.process_metrics_from_detector)
-        self.conveyor_metrics.overall_health_updated.connect(self.alert_window.update_overall_health)
-        if self.metrics_dashboard_window:
-            self.conveyor_metrics.metrics_for_api_and_dashboard.connect(self.metrics_dashboard_window.update_live_metrics)
-
-    def update_control_states(self):
-        has_rois = bool(self.rois); is_monitoring = self.monitoring_active_flag; self.add_roi_btn.setEnabled(not is_monitoring); self.delete_roi_btn.setEnabled(has_rois and not is_monitoring and bool(self.roi_list_widget.currentItem())); self.clear_rois_btn.setEnabled(has_rois and not is_monitoring); self.save_rois_btn.setEnabled(has_rois and not is_monitoring); self.load_rois_btn.setEnabled(not is_monitoring); self.resolution_slider.setEnabled(not is_monitoring); self.interval_spinbox.setEnabled(not is_monitoring); self.jams_only_radio.setEnabled(not is_monitoring); self.all_colors_radio.setEnabled(not is_monitoring); self.start_monitor_btn.setEnabled(has_rois and not is_monitoring); self.stop_monitor_btn.setEnabled(is_monitoring); self.metrics_dashboard_btn.setEnabled(True); self.web_dashboard_btn.setEnabled(self.flask_api_thread is not None and self.flask_api_thread.isRunning())
-    
-    def update_resource_usage(self): self.cpu_label.setText(f"CPU: {psutil.cpu_percent():.1f}%"); self.memory_label.setText(f"Mem: {psutil.virtual_memory().percent:.1f}%")
-    
-    def update_clock(self): now = datetime.now(); self.clock_label.setText(now.strftime("%H:%M:%S")); self.check_monitoring_schedule(now)
-    
-    def check_monitoring_schedule(self, now):
-        if not self.schedule_enabled_check.isChecked(): return
-        hour, start, end = now.hour, self.stop_start_hour_spin.value(), self.stop_end_hour_spin.value()
-        in_stop_period = (hour >= start or hour < end) if start > end else (start <= hour < end)
-        if in_stop_period and self.monitoring_active_flag: self.stop_monitoring_session(); logger.info("Auto-stopped monitoring.")
-        elif not in_stop_period and not self.monitoring_active_flag and self.rois: self.start_monitoring_session(); logger.info("Auto-started monitoring.")
-    
-    def add_new_roi(self):
-        monitors = get_monitors(); selector = MonitorSelector(monitors, self)
-        if selector.exec_() == QDialog.Accepted:
-            monitor = selector.get_selected_monitor(); title, ok = QInputDialog.getText(self, "ROI Name", "Enter ROI name:")
-            if ok and title and title not in self.rois:
-                monitor_details = {"top": monitor.y, "left": monitor.x, "width": monitor.width, "height": monitor.height, "mon": monitors.index(monitor) + 1}
-                self.hide(); time.sleep(0.2)
-                try:
-                    overlay = ROISelectionOverlay(monitor_details);
-                    if overlay.exec_() == QDialog.Accepted:
-                        rect = overlay.get_selected_rect()
-                        if rect and rect.width() > 5 and rect.height() > 5:
-                            roi_tuple = (rect.x(), rect.y(), rect.width(), rect.height())
-                            self.rois[title] = ROIInfo(roi=roi_tuple, monitor_info=monitor_details, title=title)
-                            self.roi_list_widget.addItem(f"{title}: ({rect.width()}x{rect.height()})")
-                finally: self.show(); self.activateWindow()
-        self.update_control_states()
-    
-    def delete_selected_roi(self):
-        item = self.roi_list_widget.currentItem();
-        if item and QMessageBox.question(self, 'Confirm Delete', f'Delete "{item.text().split(":")[0]}"?', QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            title = item.text().split(":")[0]; del self.rois[title]; self.roi_list_widget.takeItem(self.roi_list_widget.row(item)); self.alert_window.remove_region(title)
-        self.update_control_states()
-    
-    def clear_all_rois_confirmed(self):
-        if self.rois and QMessageBox.question(self, 'Confirm Clear', 'Delete all ROIs?', QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            self.rois.clear(); self.roi_list_widget.clear(); self.alert_window.clear_all_regions()
-        self.update_control_states()
-    
-    def rename_selected_roi(self, item):
-        old_title = item.text().split(":")[0]; new_title, ok = QInputDialog.getText(self, 'Rename ROI', 'New name:', text=old_title)
-        if ok and new_title and new_title != old_title and new_title not in self.rois:
-            self.rois[new_title] = self.rois.pop(old_title); self.rois[new_title].title = new_title; item.setText(f"{new_title}: ({self.rois[new_title].roi[2]}x{self.rois[new_title].roi[3]})")
-    
-    def show_roi_context_menu(self, pos):
-        item = self.roi_list_widget.itemAt(pos)
-        if not item: return
-        menu = QMenu(); rename = menu.addAction("Rename"); delete = menu.addAction("Delete")
-        action = menu.exec_(self.roi_list_widget.mapToGlobal(pos))
-        if action == rename: self.rename_selected_roi(item)
-        elif action == delete: self.delete_selected_roi()
-    
-    def update_resolution_label(self, val): self.resolution_value_label.setText(f"{val/100.0:.2f}")
-    
-    def start_monitoring_session(self):
-        if not self.rois: return
-        self.detection_mode_all_colors = self.all_colors_radio.isChecked() # Update mode before passing to detector
-        self.anomaly_detector.update_config(self.rois, self.resolution_slider.value(), self.interval_spinbox.value(), self.detection_mode_all_colors)
-        self.anomaly_detector.start(); self.alert_window.show(); self.monitoring_active_flag = True; self.update_control_states()
-    
-    def stop_monitoring_session(self):
-        if not self.monitoring_active_flag: return
-        self.anomaly_detector.stop(); self.monitoring_active_flag = False; self.update_control_states()
-    
-    def save_rois_to_file(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save ROIs", str(BASE_DIR/"roi_config.json"), "JSON (*.json)")
-        if path:
-            try:
-                with open(path, 'w') as f: json.dump({t: r.__dict__ for t, r in self.rois.items()}, f, indent=4)
-            except Exception as e: QMessageBox.critical(self, "Save Error", str(e))
-    
-    def load_rois_from_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Load ROIs", str(BASE_DIR), "JSON (*.json)")
-        if path:
-            try:
-                with open(path, 'r') as f: loaded = json.load(f)
-                self.rois.clear(); self.roi_list_widget.clear(); self.alert_window.clear_all_regions()
-                for title, data in loaded.items():
-                    self.rois[title] = ROIInfo(**data)
-                    self.roi_list_widget.addItem(f"{title}: ({data['roi'][2]}x{data['roi'][3]})")
-            except Exception as e: QMessageBox.critical(self, "Load Error", str(e))
-        self.update_control_states()
-    
-    def save_settings(self):
-        settings = {"rois": {t: r.__dict__ for t, r in self.rois.items()}, "resolution_scale": self.resolution_slider.value(), "capture_interval": self.interval_spinbox.value(), "detect_all_colors": self.all_colors_radio.isChecked(), "auto_schedule_enabled": self.schedule_enabled_check.isChecked(), "auto_schedule_stop_from": self.stop_start_hour_spin.value(), "auto_schedule_stop_to": self.stop_end_hour_spin.value()}
-        try:
-            with open(BASE_DIR / "app_settings.json", 'w') as f: json.dump(settings, f, indent=4)
-        except Exception as e: logger.error(f"Save settings error: {e}")
-    
-    def load_settings(self):
-        path = BASE_DIR / "app_settings.json"
-        if not path.exists(): return
-        try:
-            with open(path, 'r') as f: settings = json.load(f)
-            self.resolution_slider.setValue(settings.get("resolution_scale", 50)); self.interval_spinbox.setValue(settings.get("capture_interval", 1.0)); 
-            self.detection_mode_all_colors = settings.get("detect_all_colors", False)
-            self.all_colors_radio.setChecked(self.detection_mode_all_colors); self.jams_only_radio.setChecked(not self.detection_mode_all_colors); 
-            self.schedule_enabled_check.setChecked(settings.get("auto_schedule_enabled", False)); self.stop_start_hour_spin.setValue(settings.get("auto_schedule_stop_from", 17)); self.stop_end_hour_spin.setValue(settings.get("auto_schedule_stop_to", 9))
-            self.rois.clear(); self.roi_list_widget.clear()
-            for title, data in settings.get("rois", {}).items():
-                self.rois[title] = ROIInfo(**data)
-                self.roi_list_widget.addItem(f"{title}: ({data['roi'][2]}x{data['roi'][3]})")
-        except Exception as e: logger.error(f"Load settings error: {e}")
-        self.update_control_states()
-    
-    def show_metrics_dashboard(self):
-        if not self.metrics_dashboard_window or not self.metrics_dashboard_window.isVisible():
-            self.metrics_dashboard_window = MetricsDashboard(self.data_logger, self); self.metrics_dashboard_window.show()
-        else: self.metrics_dashboard_window.activateWindow()
-    
-    def start_flask_api(self):
-        if self.flask_api_thread and self.flask_api_thread.isRunning(): return
-        self.flask_api_thread = FlaskAppWrapper(self.data_logger, FLASK_HOST, FLASK_PORT)
-        self.flask_api_thread.api_started.connect(lambda h, p: self.status_bar.showMessage(f"Web API: http://{h}:{p}"))
-        self.flask_api_thread.api_error.connect(lambda err: QMessageBox.critical(self, "API Error", err))
-        self.flask_api_thread.start(); self.update_control_states()
-    
-    def open_web_dashboard(self):
-        if self.flask_api_thread and self.flask_api_thread.isRunning(): webbrowser.open(f"http://{self.flask_api_thread.host}:{self.flask_api_thread.port}/dashboard")
-    
-    def closeEvent(self, event):
-        self.stop_monitoring_session(); self.save_settings()
-        if self.alert_window: self.alert_window.close()
-        if self.metrics_dashboard_window: self.metrics_dashboard_window.close()
-        if self.flask_api_thread: self.flask_api_thread.shutdown()
-        super().closeEvent(event)
-
-
-# --- ROI Selection Overlay ---
 class ROISelectionOverlay(QDialog):
     def __init__(self, monitor_geom: Dict[str, int], parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -853,7 +702,6 @@ class ROISelectionOverlay(QDialog):
         return self.selected_rect
 
 
-# --- Metrics Dashboard (pyqtgraph) ---
 class MetricsDashboard(QMainWindow):
     # This is a simplified version of the original MetricsDashboard
     # focusing on showing live and some historical data.
@@ -1015,22 +863,180 @@ class MetricsDashboard(QMainWindow):
         super().closeEvent(event)
 
 
-# --- Main Execution ---
+class MainApplicationWindow(QMainWindow):
+    session_id_received = pyqtSignal(int)
+    def __init__(self):
+        super().__init__(); self.rois = {}; self.monitoring_active_flag = False; self.detection_mode_all_colors = False; self.current_session_id = None; self.last_health_snapshot = (100.0, 0)
+        self.data_logger = DataLogger(DB_PATH, INEFFICIENCY_DB_PATH); self.alert_window = AlertWindow(); self.anomaly_detector = AnomalyDetector(); self.conveyor_metrics = ConveyorMetrics(); self.reporting_dashboard = None
+        self.data_logger.start(); self.initUI(); self.connect_signals(); self.load_settings()
+        self.resource_timer = QTimer(self); self.resource_timer.timeout.connect(self.update_resource_usage); self.resource_timer.start(2000)
+        self.clock_timer = QTimer(self); self.clock_timer.timeout.connect(self.update_clock); self.clock_timer.start(1000)
+        self.report_scheduler = QTimer(self); self.report_scheduler.timeout.connect(self.run_scheduled_reports); self.report_scheduler.start(60000)
+        self.health_snapshot_timer = QTimer(self); self.health_snapshot_timer.timeout.connect(self.log_health_snapshot)
+    def initUI(self):
+        self.setWindowTitle(APP_NAME); self.setGeometry(100, 100, 600, 800)
+        central_widget = QWidget(); self.setCentralWidget(central_widget); main_layout = QVBoxLayout(central_widget)
+        controls_group = QGroupBox("Controls"); controls_layout = QVBoxLayout(controls_group); resource_layout = QHBoxLayout(); self.cpu_label = QLabel("CPU: --%"); self.memory_label = QLabel("Mem: --%"); resource_layout.addWidget(self.cpu_label); resource_layout.addWidget(self.memory_label); controls_layout.addLayout(resource_layout)
+        roi_buttons_layout = QGridLayout(); self.add_roi_btn = QPushButton(get_standard_icon(QStyle.SP_FileDialogNewFolder), " Add ROI"); self.delete_roi_btn = QPushButton(get_standard_icon(QStyle.SP_DialogDiscardButton), " Delete ROI"); self.clear_rois_btn = QPushButton(get_standard_icon(QStyle.SP_TrashIcon), " Clear All ROIs"); roi_buttons_layout.addWidget(self.add_roi_btn, 0, 0); roi_buttons_layout.addWidget(self.delete_roi_btn, 0, 1); roi_buttons_layout.addWidget(self.clear_rois_btn, 0, 2); controls_layout.addLayout(roi_buttons_layout)
+        saveload_buttons_layout = QHBoxLayout(); self.save_rois_btn = QPushButton(get_standard_icon(QStyle.SP_DialogSaveButton), " Save ROIs"); self.load_rois_btn = QPushButton(get_standard_icon(QStyle.SP_DialogOpenButton), " Load ROIs"); saveload_buttons_layout.addWidget(self.save_rois_btn); saveload_buttons_layout.addWidget(self.load_rois_btn); controls_layout.addLayout(saveload_buttons_layout); main_layout.addWidget(controls_group)
+        regions_group = QGroupBox("Monitored Regions"); regions_layout = QVBoxLayout(regions_group); self.roi_list_widget = QListWidget(); self.roi_list_widget.setContextMenuPolicy(Qt.CustomContextMenu); regions_layout.addWidget(self.roi_list_widget); main_layout.addWidget(regions_group)
+        settings_group = QGroupBox("Settings"); settings_layout = QGridLayout(settings_group)
+        settings_layout.addWidget(QLabel("Resolution Scale:"), 0, 0); self.resolution_slider = QSlider(Qt.Horizontal); self.resolution_slider.setRange(10, 100); self.resolution_slider.setValue(RESOLUTION_SCALE_DEFAULT); self.resolution_value_label = QLabel(f"{RESOLUTION_SCALE_DEFAULT/100.0:.2f}"); resolution_hbox = QHBoxLayout(); resolution_hbox.addWidget(self.resolution_slider); resolution_hbox.addWidget(self.resolution_value_label); settings_layout.addLayout(resolution_hbox, 0, 1, 1, 2)
+        settings_layout.addWidget(QLabel("Capture Interval (s):"), 1, 0); self.interval_spinbox = QDoubleSpinBox(); self.interval_spinbox.setRange(0.1, 10.0); self.interval_spinbox.setValue(CAPTURE_INTERVAL_DEFAULT); self.interval_spinbox.setSingleStep(0.1); settings_layout.addWidget(self.interval_spinbox, 1, 1, 1, 2)
+        settings_layout.addWidget(QLabel("Detection Mode:"), 2, 0); self.jams_only_radio = QRadioButton("Jams & E-Stops Only"); self.all_colors_radio = QRadioButton("All Colors"); self.jams_only_radio.setChecked(not self.detection_mode_all_colors); self.all_colors_radio.setChecked(self.detection_mode_all_colors); detection_mode_hbox = QHBoxLayout(); detection_mode_hbox.addWidget(self.jams_only_radio); detection_mode_hbox.addWidget(self.all_colors_radio); settings_layout.addLayout(detection_mode_hbox, 2, 1, 1, 2)
+        settings_layout.addWidget(QLabel("System Time:"), 3, 0); self.clock_label = QLabel("--:--:--"); self.clock_label.setFont(QFont("Arial", 10, QFont.Bold)); settings_layout.addWidget(self.clock_label, 3, 1)
+        schedule_group = QGroupBox("Auto Monitoring"); schedule_layout = QGridLayout(schedule_group); self.schedule_enabled_check = QCheckBox("Enable Auto Start/Stop"); schedule_layout.addWidget(self.schedule_enabled_check, 0, 0, 1, 2); schedule_layout.addWidget(QLabel("Stop Between:"), 1, 0); self.stop_start_hour_spin = QSpinBox(); self.stop_start_hour_spin.setRange(0,23); self.stop_start_hour_spin.setValue(17); schedule_layout.addWidget(self.stop_start_hour_spin, 1, 1); schedule_layout.addWidget(QLabel("and:"), 2, 0); self.stop_end_hour_spin = QSpinBox(); self.stop_end_hour_spin.setRange(0,23); self.stop_end_hour_spin.setValue(9); schedule_layout.addWidget(self.stop_end_hour_spin, 2, 1); settings_layout.addWidget(schedule_group, 4,0,1,3)
+        main_layout.addWidget(settings_group); main_layout.addStretch(1)
+        monitoring_buttons_layout = QHBoxLayout(); self.start_monitor_btn = QPushButton(get_standard_icon(QStyle.SP_MediaPlay), " Start Monitoring"); self.stop_monitor_btn = QPushButton(get_standard_icon(QStyle.SP_MediaStop), " Stop Monitoring"); self.reporting_btn = QPushButton(get_standard_icon(QStyle.SP_DialogHelpButton), " Reporting Dashboard"); monitoring_buttons_layout.addWidget(self.start_monitor_btn); monitoring_buttons_layout.addWidget(self.stop_monitor_btn); monitoring_buttons_layout.addWidget(self.reporting_btn)
+        main_layout.addLayout(monitoring_buttons_layout)
+        self.status_bar = QStatusBar(); self.setStatusBar(self.status_bar); self.status_bar.showMessage("Ready.")
+        self.update_control_states()
+    def connect_signals(self):
+        self.add_roi_btn.clicked.connect(self.add_new_roi); self.delete_roi_btn.clicked.connect(self.delete_selected_roi); self.clear_rois_btn.clicked.connect(self.clear_all_rois_confirmed); self.save_rois_btn.clicked.connect(self.save_rois_to_file); self.load_rois_btn.clicked.connect(self.load_rois_from_file); self.roi_list_widget.customContextMenuRequested.connect(self.show_roi_context_menu); self.roi_list_widget.itemDoubleClicked.connect(self.rename_selected_roi); self.resolution_slider.valueChanged.connect(self.update_resolution_label); self.start_monitor_btn.clicked.connect(self.start_monitoring_session); self.stop_monitor_btn.clicked.connect(self.stop_monitoring_session); self.reporting_btn.clicked.connect(self.show_reporting_dashboard)
+        
+        self.session_id_received.connect(self._on_session_id_received)
+        self.anomaly_detector.new_region_status.connect(self.alert_window.update_region_status)
+        self.anomaly_detector.metrics_update_for_logging.connect(self.conveyor_metrics.process_metrics)
+        self.anomaly_detector.anomaly_ended.connect(self.route_completed_event_to_logger)
+        self.conveyor_metrics.health_updated.connect(self.alert_window.update_overall_health)
+        self.conveyor_metrics.health_updated.connect(lambda h, a: setattr(self, 'last_health_snapshot', (h, a)))
+
+    @pyqtSlot(dict)
+    def route_completed_event_to_logger(self, data: dict):
+        """Inspects event type and routes it to the correct logger queue."""
+        if not self.current_session_id: return
+        data['session_id'] = self.current_session_id
+        
+        primary_color_name = data.get('primary_event_type_name')
+        if primary_color_name in ['red', 'orange']:
+            self.data_logger.add_log_entry('LOG_CRITICAL_EVENT', data)
+        elif primary_color_name in ['blue', 'purple', 'grey']:
+            self.data_logger.add_log_entry('LOG_INEFFICIENCY_EVENT', data)
+    
+    def start_monitoring_session(self):
+        if not self.rois: return
+        self.start_monitor_btn.setEnabled(False); self.status_bar.showMessage("Initializing session...")
+        self.detection_mode_all_colors = self.all_colors_radio.isChecked()
+        settings = {"resolution":self.resolution_slider.value(), "interval":self.interval_spinbox.value(), "mode":"all_colors" if self.detection_mode_all_colors else "jams_only"}
+        log_data = {'start_time': datetime.now(), 'roi_count': len(self.rois), 'settings_json': json.dumps(settings), 'callback': self.session_id_received.emit }
+        self.data_logger.add_log_entry('START_SESSION', log_data)
+    @pyqtSlot(int)
+    def _on_session_id_received(self, new_id: int):
+        self.current_session_id = new_id; logger.info(f"New monitoring session started with ID: {self.current_session_id}")
+        settings = {"resolution":self.resolution_slider.value(), "interval":self.interval_spinbox.value(), "mode":"all_colors" if self.all_colors_radio.isChecked() else "jams_only"}
+        self.anomaly_detector.update_config(self.rois, settings["resolution"], settings["interval"], self.all_colors_radio.isChecked())
+        self.anomaly_detector.start(); self.alert_window.show(); self.monitoring_active_flag = True; self.health_snapshot_timer.start(int(HEALTH_SNAPSHOT_INTERVAL * 1000)); self.update_control_states()
+        self.status_bar.showMessage(f"Monitoring active. Session ID: {self.current_session_id}")
+    def stop_monitoring_session(self):
+        if not self.monitoring_active_flag: return
+        self.anomaly_detector.stop(); self.monitoring_active_flag = False; self.health_snapshot_timer.stop()
+        if self.current_session_id:
+            self.data_logger.add_log_entry('END_SESSION', {'end_time': datetime.now(), 'session_id': self.current_session_id})
+            logger.info(f"Monitoring session {self.current_session_id} ended.")
+        self.current_session_id = None; self.update_control_states(); self.status_bar.showMessage("Monitoring stopped.")
+    def log_health_snapshot(self):
+        if self.monitoring_active_flag and self.current_session_id and hasattr(self, 'last_health_snapshot'):
+            health, active_anomalies = self.last_health_snapshot
+            self.data_logger.add_log_entry('LOG_SNAPSHOT', {'session_id': self.current_session_id, 'timestamp': datetime.now(), 'health': health, 'active_anomalies': active_anomalies})
+    def run_scheduled_reports(self):
+        now = datetime.now()
+        if now.hour in [6, 18] and now.minute == 0: self.data_logger.generate_12_hour_report_archive()
+    def show_reporting_dashboard(self):
+        if not self.reporting_dashboard or not self.reporting_dashboard.isVisible():
+            self.reporting_dashboard = ReportingDashboard(self.data_logger, self); self.reporting_dashboard.show()
+        else: self.reporting_dashboard.activateWindow()
+    def closeEvent(self, event):
+        self.stop_monitoring_session(); self.save_settings(); self.data_logger.stop(); self.data_logger.wait()
+        if self.alert_window: self.alert_window.close()
+        if self.reporting_dashboard: self.reporting_dashboard.close()
+        super().closeEvent(event)
+    def update_control_states(self):
+        has_rois = bool(self.rois); is_monitoring = self.monitoring_active_flag; self.start_monitor_btn.setEnabled(has_rois and not is_monitoring); self.add_roi_btn.setEnabled(not is_monitoring); self.delete_roi_btn.setEnabled(has_rois and not is_monitoring and bool(self.roi_list_widget.currentItem())); self.clear_rois_btn.setEnabled(has_rois and not is_monitoring); self.save_rois_btn.setEnabled(has_rois and not is_monitoring); self.load_rois_btn.setEnabled(not is_monitoring); self.resolution_slider.setEnabled(not is_monitoring); self.interval_spinbox.setEnabled(not is_monitoring); self.jams_only_radio.setEnabled(not is_monitoring); self.all_colors_radio.setEnabled(not is_monitoring); self.stop_monitor_btn.setEnabled(is_monitoring); self.reporting_btn.setEnabled(True)
+    def update_resource_usage(self): self.cpu_label.setText(f"CPU: {psutil.cpu_percent():.1f}%"); self.memory_label.setText(f"Mem: {psutil.virtual_memory().percent:.1f}%")
+    def update_clock(self): now = datetime.now(); self.clock_label.setText(now.strftime("%H:%M:%S")); self.check_monitoring_schedule(now)
+    def check_monitoring_schedule(self, now):
+        if not self.schedule_enabled_check.isChecked(): return
+        hour, start, end = now.hour, self.stop_start_hour_spin.value(), self.stop_end_hour_spin.value()
+        in_stop_period = (hour >= start or hour < end) if start > end else (start <= hour < end)
+        if in_stop_period and self.monitoring_active_flag: self.stop_monitoring_session(); logger.info("Auto-stopped monitoring.")
+        elif not in_stop_period and not self.monitoring_active_flag and self.rois: self.start_monitoring_session(); logger.info("Auto-started monitoring.")
+    def add_new_roi(self):
+        monitors = get_monitors(); selector = MonitorSelector(monitors, self)
+        if selector.exec_() == QDialog.Accepted:
+            monitor = selector.get_selected_monitor(); title, ok = QInputDialog.getText(self, "ROI Name", "Enter ROI name:")
+            if ok and title and title not in self.rois:
+                monitor_details = {"top": monitor.y, "left": monitor.x, "width": monitor.width, "height": monitor.height, "mon": monitors.index(monitor) + 1}
+                self.hide(); time.sleep(0.2)
+                try:
+                    overlay = ROISelectionOverlay(monitor_details);
+                    if overlay.exec_() == QDialog.Accepted:
+                        rect = overlay.get_selected_rect()
+                        if rect and rect.width() > 5 and rect.height() > 5:
+                            roi_tuple = (rect.x(), rect.y(), rect.width(), rect.height()); self.rois[title] = ROIInfo(roi=roi_tuple, monitor_info=monitor_details, title=title); self.roi_list_widget.addItem(f"{title}: ({rect.width()}x{rect.height()})")
+                finally: self.show(); self.activateWindow()
+        self.update_control_states()
+    def delete_selected_roi(self):
+        item = self.roi_list_widget.currentItem();
+        if item and QMessageBox.question(self, 'Confirm Delete', f'Delete "{item.text().split(":")[0]}"?', QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+            title = item.text().split(":")[0]; del self.rois[title]; self.roi_list_widget.takeItem(self.roi_list_widget.row(item)); self.alert_window.remove_region(title)
+        self.update_control_states()
+    def clear_all_rois_confirmed(self):
+        if self.rois and QMessageBox.question(self, 'Confirm Clear', 'Delete all ROIs?', QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+            self.rois.clear(); self.roi_list_widget.clear(); self.alert_window.clear_all_regions()
+        self.update_control_states()
+    def rename_selected_roi(self, item):
+        old_title = item.text().split(":")[0]; new_title, ok = QInputDialog.getText(self, 'Rename ROI', 'New name:', text=old_title)
+        if ok and new_title and new_title != old_title and new_title not in self.rois:
+            self.rois[new_title] = self.rois.pop(old_title); self.rois[new_title].title = new_title; item.setText(f"{new_title}: ({self.rois[new_title].roi[2]}x{self.rois[new_title].roi[3]})")
+    def show_roi_context_menu(self, pos):
+        item = self.roi_list_widget.itemAt(pos)
+        if not item: return
+        menu = QMenu(); rename = menu.addAction("Rename"); delete = menu.addAction("Delete")
+        action = menu.exec_(self.roi_list_widget.mapToGlobal(pos))
+        if action == rename: self.rename_selected_roi(item)
+        elif action == delete: self.delete_selected_roi()
+    def update_resolution_label(self, val): self.resolution_value_label.setText(f"{val/100.0:.2f}")
+    def save_rois_to_file(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save ROIs", str(BASE_DIR/"roi_config.json"), "JSON (*.json)")
+        if path:
+            try:
+                with open(path, 'w') as f: json.dump({t: r.__dict__ for t, r in self.rois.items()}, f, indent=4)
+            except Exception as e: QMessageBox.critical(self, "Save Error", str(e))
+    def load_rois_from_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load ROIs", str(BASE_DIR), "JSON (*.json)")
+        if path:
+            try:
+                with open(path, 'r') as f: loaded = json.load(f)
+                self.rois.clear(); self.roi_list_widget.clear(); self.alert_window.clear_all_regions()
+                for title, data in loaded.items(): self.rois[title] = ROIInfo(**data); self.roi_list_widget.addItem(f"{title}: ({data['roi'][2]}x{data['roi'][3]})")
+            except Exception as e: QMessageBox.critical(self, "Load Error", str(e))
+        self.update_control_states()
+    def save_settings(self):
+        settings = {"rois": {t: r.__dict__ for t, r in self.rois.items()}, "resolution_scale": self.resolution_slider.value(), "capture_interval": self.interval_spinbox.value(), "detect_all_colors": self.all_colors_radio.isChecked(), "auto_schedule_enabled": self.schedule_enabled_check.isChecked(), "auto_schedule_stop_from": self.stop_start_hour_spin.value(), "auto_schedule_stop_to": self.stop_end_hour_spin.value()}
+        try:
+            with open(BASE_DIR / "app_settings.json", 'w') as f: json.dump(settings, f, indent=4)
+        except Exception as e: logger.error(f"Save settings error: {e}")
+    def load_settings(self):
+        path = BASE_DIR / "app_settings.json"
+        if not path.exists(): return
+        try:
+            with open(path, 'r') as f: settings = json.load(f)
+            self.resolution_slider.setValue(settings.get("resolution_scale", 50)); self.interval_spinbox.setValue(settings.get("capture_interval", 1.0)); 
+            self.detection_mode_all_colors = settings.get("detect_all_colors", False)
+            self.all_colors_radio.setChecked(self.detection_mode_all_colors); self.jams_only_radio.setChecked(not self.detection_mode_all_colors); 
+            self.schedule_enabled_check.setChecked(settings.get("auto_schedule_enabled", False)); self.stop_start_hour_spin.setValue(settings.get("auto_schedule_stop_from", 17)); self.stop_end_hour_spin.setValue(settings.get("auto_schedule_stop_to", 9))
+            self.rois.clear(); self.roi_list_widget.clear()
+            for title, data in settings.get("rois", {}).items():
+                self.rois[title] = ROIInfo(**data)
+                self.roi_list_widget.addItem(f"{title}: ({data['roi'][2]}x{data['roi'][3]})")
+        except Exception as e: logger.error(f"Load settings error: {e}")
+        self.update_control_states()
+
+
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(str(BASE_DIR / "app_icon.png")) if (BASE_DIR / "app_icon.png").exists() else get_standard_icon(QStyle.SP_ComputerIcon))
-    
-    # Apply a basic style
     app.setStyle("Fusion")
-    # palette = QPalette() # Dark theme example - can be expanded
-    # palette.setColor(QPalette.Window, QColor(53, 53, 53))
-    # palette.setColor(QPalette.WindowText, Qt.white)
-    # app.setPalette(palette)
-
     main_window = MainApplicationWindow()
     main_window.show()
-    
-    exit_code = app.exec_()
-    logger.info(f"Application exited with code {exit_code}.")
-    sys.exit(exit_code)
-
+    sys.exit(app.exec_())
