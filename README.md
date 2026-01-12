@@ -2,7 +2,7 @@
 
 A comprehensive, enterprise-grade OCR-based alarm monitoring system with real-time dashboard, health monitoring, and reliability features designed for 24/7 continuous operation in industrial environments.
 
-## 🚀 **Key Features**
+## **Key Features**
 
 ### **Core Monitoring Capabilities**
 - **6-Digit Key-Based Identification**: Advanced alarm matching using unique numerical identifiers (e.g., `140015`)
@@ -28,7 +28,7 @@ A comprehensive, enterprise-grade OCR-based alarm monitoring system with real-ti
 - **Color-Coded Severity**: Purple (>30min), Red (>5min), Orange (>1min), Normal (<1min)
 - **Admin Controls**: Reset button for granular jam count tracking
 
-## 📁 **Project Structure**
+## **Project Structure**
 
 ```
 projectSanDWRM/
@@ -258,7 +258,7 @@ Edit `config.json` for advanced settings:
 }
 ```
 
-## 🚀 **Running the Application**
+## **Running the Application**
 
 ### **Standard Operation**
 ```cmd
@@ -337,7 +337,7 @@ Enhanced features: Health monitoring, Performance analytics, Reliability
 
 **Reset Process:**
 ```
-⚠️ ADMIN FUNCTION ⚠️
+ADMIN FUNCTION 
 
 This will reset ALL jam count statistics to zero.
 A backup will be created before clearing the data.
@@ -798,3 +798,4 @@ This Enhanced Alarm Monitor system is designed for industrial alarm monitoring a
 ---
 
 *For technical support or feature requests, please refer to the system administrator or development team.*
+
